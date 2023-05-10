@@ -1,0 +1,250 @@
+diff --git a/cinn/backends/codegen_cuda_dev.cc b/cinn/backends/codegen_cuda_dev.cc
+index 415ab5d0..7a6b463b 100644
+--- a/cinn/backends/codegen_cuda_dev.cc
++++ b/cinn/backends/codegen_cuda_dev.cc
+@@ -33,7 +33,9 @@ const std::string CodeGenCUDA_Dev::source_header_ =
+     R"(#include <cstdint>
+ 
+ #define CINN_WITH_CUDA
++#include "bfloat16.h"
+ #include "float16.h"
++using cinn::common::bfloat16;
+ using cinn::common::float16;
+ using cinn::common::half4;
+ using cinn::common::half8;
+diff --git a/cinn/backends/codegen_cuda_host.cc b/cinn/backends/codegen_cuda_host.cc
+index fa0a8a5e..38774b18 100644
+--- a/cinn/backends/codegen_cuda_host.cc
++++ b/cinn/backends/codegen_cuda_host.cc
+@@ -153,7 +153,7 @@ llvm::Value* CodeGenCUDA_Host::LowerGPUKernelLauncher(const ir::_LoweredFunc_* f
+         call_args.push_back(llvm::ConstantFP::get(b_->getDoubleTy(), llvm::APFloat(r_arg.as_double())));
+       } else if (r_arg.type().is_bfloat16()) {
+         call_args.push_back(
+-            llvm::ConstantFP::get(b_->getHalfTy(), llvm::APFloat(static_cast<float>(r_arg.as_bfloat16()))));
++            llvm::ConstantFP::get(b_->getBFloatTy(), llvm::APFloat(static_cast<float>(r_arg.as_bfloat16()))));
+       } else if (r_arg.type().is_float16()) {
+         call_args.push_back(
+             llvm::ConstantFP::get(b_->getHalfTy(), llvm::APFloat(static_cast<float>(r_arg.as_float16()))));
+diff --git a/cinn/backends/llvm/codegen_llvm.cc b/cinn/backends/llvm/codegen_llvm.cc
+index 026882ec..318f1d02 100644
+--- a/cinn/backends/llvm/codegen_llvm.cc
++++ b/cinn/backends/llvm/codegen_llvm.cc
+@@ -1487,6 +1487,8 @@ llvm::Value *CodeGenLLVM::Visit(const ir::intrinsics::PodValueToX *op) {
+     callee = m_->getFunction(runtime::intrinsic::pod_value_to_float);
+   } else if (to_type == type_of<double>()) {
+     callee = m_->getFunction(runtime::intrinsic::pod_value_to_double);
++  } else if (to_type == type_of<bfloat16>()) {
++    callee = m_->getFunction(runtime::intrinsic::pod_value_to_bfloat16);
+   } else if (to_type == type_of<float16>()) {
+     callee = m_->getFunction(runtime::intrinsic::pod_value_to_float16);
+   } else if (to_type == type_of<bool>()) {
+diff --git a/cinn/frontend/paddle/framework.proto b/cinn/frontend/paddle/framework.proto
+index 0cb4f977..45c0985b 100644
+--- a/cinn/frontend/paddle/framework.proto
++++ b/cinn/frontend/paddle/framework.proto
+@@ -112,6 +112,7 @@ message VarType {
+     SIZE_T = 19;
+     UINT8 = 20;
+     INT8 = 21;
++    BF16 = 22;
+ 
+     // Other types that may need additional descriptions
+     LOD_TENSOR = 7;
+diff --git a/cinn/frontend/paddle/model_parser.cc b/cinn/frontend/paddle/model_parser.cc
+index 8ab48da3..e337ff24 100755
+--- a/cinn/frontend/paddle/model_parser.cc
++++ b/cinn/frontend/paddle/model_parser.cc
+@@ -33,6 +33,7 @@ int SizeOfType(framework_proto::VarType::Type type) {
+   case Type::VarType_Type_##desc: \
+     return sizeof(type);
+     DO(BOOL, bool);
++    DO(BF16, float);
+     DO(FP16, float);
+     DO(FP32, float);
+     DO(INT8, int8_t);
+diff --git a/cinn/frontend/paddle/pb/var_desc.cc b/cinn/frontend/paddle/pb/var_desc.cc
+index 77e3df34..1e85d9a2 100644
+--- a/cinn/frontend/paddle/pb/var_desc.cc
++++ b/cinn/frontend/paddle/pb/var_desc.cc
+@@ -140,6 +140,7 @@ void VarDesc::SetDataType(VarDescAPI::VarDataType data_type) {
+     SET_DATA_TYPE_CASE_ITEM(INT16);
+     SET_DATA_TYPE_CASE_ITEM(INT32);
+     SET_DATA_TYPE_CASE_ITEM(INT64);
++    SET_DATA_TYPE_CASE_ITEM(BF16);
+     SET_DATA_TYPE_CASE_ITEM(FP16);
+     SET_DATA_TYPE_CASE_ITEM(FP32);
+     SET_DATA_TYPE_CASE_ITEM(FP64);
+@@ -184,6 +185,7 @@ cpp::VarDescAPI::VarDataType VarDesc::GetDataType() const {
+     GET_DATA_TYPE_CASE_ITEM(INT16);
+     GET_DATA_TYPE_CASE_ITEM(INT32);
+     GET_DATA_TYPE_CASE_ITEM(INT64);
++    GET_DATA_TYPE_CASE_ITEM(BF16);
+     GET_DATA_TYPE_CASE_ITEM(FP16);
+     GET_DATA_TYPE_CASE_ITEM(FP32);
+     GET_DATA_TYPE_CASE_ITEM(FP64);
+diff --git a/cinn/frontend/var_type_utils.h b/cinn/frontend/var_type_utils.h
+index 3802602d..21a6cbcb 100644
+--- a/cinn/frontend/var_type_utils.h
++++ b/cinn/frontend/var_type_utils.h
+@@ -69,6 +69,7 @@ inline common::Type CppVarType2CommonType(paddle::cpp::VarDescAPI::Type type) {
+     SET_TYPE_CASE_ITEM(INT16, I16)
+     SET_TYPE_CASE_ITEM(INT32, I32)
+     SET_TYPE_CASE_ITEM(INT64, I64)
++    SET_TYPE_CASE_ITEM(BF16, BF16)
+     SET_TYPE_CASE_ITEM(FP16, F16)
+     SET_TYPE_CASE_ITEM(FP32, F32)
+     SET_TYPE_CASE_ITEM(FP64, F64)
+diff --git a/cinn/runtime/cuda/cinn_cuda_runtime_source.cuh b/cinn/runtime/cuda/cinn_cuda_runtime_source.cuh
+index a5d751cf..90c4d649 100644
+--- a/cinn/runtime/cuda/cinn_cuda_runtime_source.cuh
++++ b/cinn/runtime/cuda/cinn_cuda_runtime_source.cuh
+@@ -371,6 +371,10 @@ EXPAND_REDUCE_FP32_MACRO(CINN_WARP_SHUFFLE_INTERNAL_IMPL)
+ EXPAND_REDUCE_FP64_MACRO(CINN_WARP_SHUFFLE_INTERNAL_IMPL)
+ EXPAND_REDUCE_BOOL_MACRO(CINN_WARP_SHUFFLE_INTERNAL_IMPL)
+ 
++#ifdef CINN_CUDA_BF16
++EXPAND_REDUCE_BF16_MACRO(CINN_WARP_SHUFFLE_INTERNAL_IMPL)
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ EXPAND_REDUCE_FP16_MACRO(CINN_WARP_SHUFFLE_INTERNAL_IMPL)
+ #endif
+@@ -392,6 +396,10 @@ EXPAND_REDUCE_FP32_MACRO(CINN_WARP_REDUCE_IMPL)
+ EXPAND_REDUCE_FP64_MACRO(CINN_WARP_REDUCE_IMPL)
+ EXPAND_REDUCE_BOOL_MACRO(CINN_WARP_REDUCE_IMPL)
+ 
++#ifdef CINN_CUDA_BF16
++EXPAND_REDUCE_BF16_MACRO(CINN_WARP_REDUCE_IMPL)
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ EXPAND_REDUCE_FP16_MACRO(CINN_WARP_REDUCE_IMPL)
+ #endif
+@@ -438,6 +446,10 @@ EXPAND_REDUCE_FP32_MACRO(CINN_BLOCK_REDUCE_INTERNAL_MACRO)
+ EXPAND_REDUCE_FP64_MACRO(CINN_BLOCK_REDUCE_INTERNAL_MACRO)
+ EXPAND_REDUCE_BOOL_MACRO(CINN_BLOCK_REDUCE_INTERNAL_MACRO)
+ 
++#ifdef CINN_CUDA_BF16
++EXPAND_REDUCE_BF16_MACRO(CINN_BLOCK_REDUCE_INTERNAL_MACRO)
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ EXPAND_REDUCE_FP16_MACRO(CINN_BLOCK_REDUCE_INTERNAL_MACRO)
+ #endif
+@@ -460,6 +472,10 @@ EXPAND_REDUCE_FP32_MACRO(CINN_BLOCK_REDUCE_IMPL)
+ EXPAND_REDUCE_FP64_MACRO(CINN_BLOCK_REDUCE_IMPL)
+ EXPAND_REDUCE_BOOL_MACRO(CINN_BLOCK_REDUCE_IMPL)
+ 
++#ifdef CINN_CUDA_BF16
++EXPAND_REDUCE_BF16_MACRO(CINN_BLOCK_REDUCE_IMPL)
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ EXPAND_REDUCE_FP16_MACRO(CINN_BLOCK_REDUCE_IMPL)
+ #endif
+@@ -481,6 +497,10 @@ EXPAND_REDUCE_FP32_MACRO(BLOCK_SHUFFLE_IMPL)
+ EXPAND_REDUCE_FP64_MACRO(BLOCK_SHUFFLE_IMPL)
+ EXPAND_REDUCE_BOOL_MACRO(BLOCK_SHUFFLE_IMPL)
+ 
++#ifdef CINN_CUDA_BF16
++EXPAND_REDUCE_BF16_MACRO(BLOCK_SHUFFLE_IMPL)
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ EXPAND_REDUCE_FP16_MACRO(BLOCK_SHUFFLE_IMPL)
+ #endif
+@@ -493,6 +513,10 @@ EXPAND_REDUCE_FP16_MACRO(BLOCK_SHUFFLE_IMPL)
+ #undef EXPAND_REDUCE_FP64_MACRO
+ #undef EXPAND_REDUCE_BOOL_MACRO
+ 
++#ifdef CINN_CUDA_BF16
++#undef EXPAND_REDUCE_BF16_MACRO
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ #undef EXPAND_REDUCE_FP16_MACRO
+ #endif
+@@ -699,6 +723,10 @@ __device__ int cinn_cuda_resize_bicubic(const int *buf,
+ #undef FN_INT32
+ #undef FN_INT64
+ 
++#ifdef CINN_CUDA_BF16
++#undef FN_BF16
++#endif
++
+ #ifdef CINN_CUDA_FP16
+ #undef FN_FP16
+ #endif
+diff --git a/cinn/runtime/cuda/cuda_module_test.cc b/cinn/runtime/cuda/cuda_module_test.cc
+index 3973b36d..f58f57d3 100644
+--- a/cinn/runtime/cuda/cuda_module_test.cc
++++ b/cinn/runtime/cuda/cuda_module_test.cc
+@@ -112,6 +112,68 @@ TEST(CUDAModule, float16) {
+   CHECK(res) << "The difference between two arrays exceeds the bound.";
+ }
+ 
++TEST(CUDAModule, bfloat16) {
++  using common::bfloat16;
++  using namespace runtime::cuda::util;
++
++  auto generate_ptx = [] {
++    backends::nvrtc::Compiler compiler;
++
++    std::string source_code = R"(
++  #include <cstdint>
++  #define CINN_WITH_CUDA
++  #include "bfloat16.h"
++  using cinn::common::bfloat16;
++
++  extern "C" __global__
++  void cast_fp32_to_bf16_cuda_kernel(const float* input, const int num, bfloat16* output) {
++    int idx = blockIdx.x * blockDim.x + threadIdx.x;
++   if (idx < num) {
++      output[idx] = bfloat16(input[idx]);
++    }
++  }
++  )";
++
++    auto ptx = compiler(source_code);
++    CHECK(!ptx.empty());
++    return ptx;
++  };
++
++  auto ptx = generate_ptx();
++
++  CUDAModule cuda_module(ptx, CUDAModule::Kind::PTX);
++  auto func = cuda_module.GetFunction(0, "cast_fp32_to_bf16_cuda_kernel");
++  ASSERT_TRUE(func);
++
++  int size = 100;
++  dim3 blocks_per_grid(1);
++  dim3 threads_per_block(100);
++
++  std::vector<float> x_host(size);
++  {
++    std::random_device r;
++    std::default_random_engine eng(r());
++    std::uniform_real_distribution<float> dis(1e-5f, 1.0f);
++    for (size_t i = 0; i < x_host.size(); ++i) {
++      x_host[i] = dis(eng);
++    }
++  }
++  Vector<float> x_device(x_host);
++  Vector<bfloat16> y_device(size);
++  auto* x_p{x_device.data()};
++  auto* y_p{y_device.data()};
++
++  void* args[] = {&x_p, &size, &y_p};
++  cuda_module.LaunchKernel(0, "cast_fp32_to_bf16_cuda_kernel", blocks_per_grid, threads_per_block, args);
++  CUDA_CALL(cudaDeviceSynchronize());
++
++  std::vector<bfloat16> y_host = y_device.to_host();
++  bool res = std::equal(x_host.begin(), x_host.end(), y_host.begin(), [](float x, bfloat16 y) -> bool {
++    return std::abs(x - static_cast<float>(y)) < 1e-2f;
++  });
++  CHECK(res) << "The difference between two arrays exceeds the bound.";
++}
++
+ }  // namespace cuda
+ }  // namespace runtime
+ }  // namespace cinn

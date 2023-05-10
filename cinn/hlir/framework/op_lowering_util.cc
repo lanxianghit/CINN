@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "cinn/hlir/framework/op_lowering_util.h"
+
+#include "cinn/hlir/pe/nn_util.h"
 #ifdef CINN_WITH_CUDA
 #include "cinn/common/bfloat16.h"
 #include "cinn/common/float16.h"
@@ -314,6 +316,19 @@ std::vector<Node*> FindConsumers(Node* node,
   return consumers;
 }
 
+std::vector<Node*> FindProducers(Node* node,
+                                 const std::unordered_set<Node*>& nodes_set,
+                                 const std::unordered_map<Node*, Node*>& virtual_consumers) {
+  auto producers = GetProducersInSet(node, nodes_set);
+  for (const auto& iter : virtual_consumers) {
+    if (iter.second == node) {
+      producers.push_back(iter.first);
+    }
+  }
+
+  return producers;
+}
+
 std::vector<Node*> TopologicalOrder(const GroupPtr& group, const std::unordered_map<Node*, Node*>& virtual_consumers) {
   std::vector<Node*> nodes_in_order;
   std::unordered_set<Node*> nodes_set = group->NodeSet();
@@ -333,6 +348,93 @@ std::vector<Node*> TopologicalOrder(const GroupPtr& group, const std::unordered_
       if (cant_be_erase) continue;
       nodes_in_order.push_back(node);
       nodes_set.erase(node);
+    }
+  }
+
+  return nodes_in_order;
+}
+
+std::vector<Node*> BFSTopologicalOrderWithPriority(const GroupPtr& group,
+                                                   const std::unordered_map<Node*, Node*>& virtual_consumers,
+                                                   const absl::flat_hash_map<std::string, shape_t>& shape_dict) {
+  struct NodeWithPriority {
+    Node* node;
+    int priority;
+  };
+
+  struct Comparator {
+    bool operator()(const NodeWithPriority& lhs, const NodeWithPriority& rhs) { return lhs.priority > rhs.priority; }
+  };
+
+  std::vector<Node*> nodes_in_order;
+  std::unordered_set<Node*> visited;
+  std::unordered_set<Node*> nodes_set = group->NodeSet();
+  std::unordered_map<Node*, int> degree_map;
+  std::priority_queue<NodeWithPriority, std::vector<NodeWithPriority>, Comparator> priority_candidates;
+  std::vector<int> visited_numel;
+
+  // Calculate the priority of a node.
+  // The smaller the value, the higher the priority.
+  // Prioritize the same shape before considering OpPattern
+  auto PriorityFunc = [&visited_numel, &shape_dict](const Node* node) -> int {
+    auto node_shape = GetOutputShape(node, shape_dict);
+    int numel       = std::accumulate(node_shape.begin(), node_shape.end(), 1, std::multiplies<int>());
+    int index       = -1;
+    for (int i = 0; i < visited_numel.size(); ++i) {
+      if (numel == visited_numel[i]) {
+        index = i;
+        break;
+      }
+    }
+    if (index == -1) {
+      index = visited_numel.size();
+      visited_numel.push_back(numel);
+    }
+    auto& op_pattern_dict = Operator::GetAttrs<OpPatternKind>("OpPattern");
+    return index * 10 + static_cast<int>(op_pattern_dict[node->op()]);
+  };
+
+  for (Node* node : nodes_set) {
+    auto consumers = FindConsumers(node, nodes_set, virtual_consumers);
+    // Some nodes may have multiple edges between them, resulting in duplicates in the consumer.
+    // We only need to calculate once.
+    std::unordered_set<Node*> consumers_without_duplicate(consumers.begin(), consumers.end());
+    degree_map[node] = consumers_without_duplicate.size();
+    if (degree_map.at(node) == 0) {
+      priority_candidates.push(NodeWithPriority{node, PriorityFunc(node)});
+    }
+  }
+
+  // Nested BFS, outer layer traverses priority, inner layer performs BFS on current priority.
+  while (!priority_candidates.empty()) {
+    Node* cur_priority_node = priority_candidates.top().node;
+    priority_candidates.pop();
+
+    std::queue<Node*> bfs_queue;
+    bfs_queue.push(cur_priority_node);
+    visited.insert(cur_priority_node);
+    while (!bfs_queue.empty()) {
+      Node* cur = bfs_queue.front();
+      bfs_queue.pop();
+
+      nodes_in_order.push_back(cur);
+      auto producers = FindProducers(cur, nodes_set, virtual_consumers);
+      std::unordered_set<Node*> producers_without_duplicate(producers.begin(), producers.end());
+      for (Node* node : producers_without_duplicate) {
+        --degree_map[node];
+        // Ensure that each node is accessed only once and maintain topological order.
+        if (visited.count(node) != 0 || degree_map[node] != 0) {
+          continue;
+        }
+        // Perform BFS access to the current priority producers
+        int node_priority = PriorityFunc(node);
+        if (node_priority <= PriorityFunc(cur_priority_node)) {
+          bfs_queue.push(node);
+          visited.insert(node);
+        } else {
+          priority_candidates.push(NodeWithPriority{node, node_priority});
+        }
+      }
     }
   }
 
@@ -416,60 +518,94 @@ void LoopAssignReduceWithoutLast(ir::IRSchedule& ir_sch,
                                  const std::vector<int>& inshape,
                                  const std::vector<int>& axes,
                                  const common::Target& target) {
-  CHECK(axes.size());
-  int lane            = 1;
-  int max_num_threads = target.max_num_threads();
-  for (int idx = axes.back() + 1; idx < inshape.size(); ++idx) {
-    lane *= inshape[idx];
-  }
-  CHECK_LE(lane, max_num_threads / 2) << "Parallel threads must less equal max_num_threads/2 on gpu!";
-  int pos   = 0;
-  int index = axes.size() - 1;
-  for (; index >= 0; --index) {
-    if (index + 1 < axes.size() && axes[index] != axes[index + 1] - 1) {
-      pos = axes[index + 1];
-      break;
-    }
+  int tail   = 0;
+  bool bound = true;
+  auto shape = pe::GetFirstStepReduceShape(inshape, axes, bound, tail);
+  CHECK(bound);
 
-    lane *= inshape[axes[index]];
-    if (lane > max_num_threads / 2) {
-      pos = axes[index];
-      break;
-    }
-
-    if (index == 0) {
-      pos = axes[0];
-    }
-  }
-
-  if (lane > max_num_threads / 2) {
-    int prefix = inshape[axes[index]];
-    int tail   = lane / prefix;
-    for (int idx = max_num_threads / tail; idx > (max_num_threads / 2) / tail; --idx) {
-      if (prefix % idx == 0) {
-        ir_sch.Split(block_name, axes[index], {-1, idx});
-        break;
+  // remove loop size = 1 and remove axis in axes.
+  std::vector<int> nshape, naxes = axes;
+  for (int idx = 0; idx < shape.size(); ++idx) {
+    if (shape[idx] == 1 && idx < axes.back()) {
+      auto iter = std::find(naxes.begin(), naxes.end(), idx);
+      if (iter != naxes.end()) {
+        naxes.erase(iter);
       }
-      CHECK_GT(idx - 1, (max_num_threads / 2) / tail) << "idx should greater than (max_num_threads / 2) / tail.";
+      for (auto& axis : naxes) {
+        if (axis > idx) {
+          --axis;
+        }
+      }
+    } else {
+      nshape.push_back(shape[idx]);
     }
   }
 
-  // insert 1
-  for (int idx = 0; idx < axes.size() - 1 - index; ++idx) {
-    auto loops = ir_sch.GetLoops(block_name);
-    ir_sch.Split(block_name, pos, {-1, ir::GetLoopExtent(loops[pos])});
+  // fuse tail for bind threadIdx.x
+  int ptail = 1;
+  int index = naxes.back() + 2;
+  for (int idx = index; idx < nshape.size(); ++idx) {
+    ptail *= nshape[idx];
   }
-  LoopOrderAssignReduce(ir_sch, block_name, axes, target);
-  // return insert 1
-  int start_index = ir_sch.GetLoops(block_name).size() - axes.size();
-  for (int idx = 0; idx < axes.size(); ++idx) {
-    auto loops = ir_sch.GetLoops(block_name);
-    if (ir::GetLoopExtent(loops[start_index]) == 1) {
-      ir_sch.Fuse({loops[start_index - 1], loops[start_index]});
+  nshape.resize(index);
+  nshape.push_back(ptail);
+
+  ir_sch.Split(block_name, 0, nshape);
+  LoopOrderAssignReduce(ir_sch, block_name, naxes, target, true);
+
+  // fuse loop for bind blockIdx.x
+  auto loops = ir_sch.GetLoops(block_name);
+  auto fsize = nshape.size() - (naxes.size() + 2);
+  if (fsize > 1) {
+    ir_sch.Fuse({loops.begin(), loops.begin() + fsize});
+  }
+
+  auto get_tile_size = [&](int idx) {
+    auto range = GetLoopExtent(loops[idx - 1]);
+    if (range > 32) {
+      return 8;
+    } else if (range > 16) {
+      return 16;
+    } else if (range > 4) {
+      return 32;
     } else {
-      ++start_index;
+      return 64;
+    }
+  };
+
+  std::vector<int> new_order;
+  loops = ir_sch.GetLoops(block_name);
+  if (fsize) {
+    int tail_index = 2;
+    auto tile_size = get_tile_size(tail_index);
+    if (GetLoopExtent(loops[tail_index]) > tile_size) {
+      // split index
+      ir_sch.Split(loops[tail_index], {-1, tile_size});
+      loops = ir_sch.GetLoops(block_name);
+      // order
+      new_order = {0, 2, 3, 1};
+    } else {
+      // order
+      new_order = {0, 2, 1};
+    }
+  } else {
+    int tail_index = 1;
+    auto tile_size = get_tile_size(tail_index);
+    if (GetLoopExtent(loops[tail_index]) > tile_size) {
+      // split index
+      ir_sch.Split(loops[tail_index], {-1, tile_size});
+      loops = ir_sch.GetLoops(block_name);
+      // order
+      new_order = {1, 2, 0};
+    } else {
+      // order
+      new_order = {1, 0};
     }
   }
+  for (int idx = new_order.size(); idx < loops.size(); ++idx) {
+    new_order.push_back(idx);
+  }
+  ir_sch.Reorder(block_name, new_order);
 }
 
 void LoopAssignReduceWithLast(ir::IRSchedule& ir_sch,
@@ -734,11 +870,11 @@ void LoopAssignReduce(ir::IRSchedule& ir_sch,
     auto rloops = ir_sch.GetLoops(reducer_data->id());
 
     for (auto& loop : rloops) {
-      extend *= loop.As<ir::For>()->extent.as_int32();
-      if (extend > loops.back().As<ir::For>()->extent.as_int32()) {
+      if (extend >= loops.back().As<ir::For>()->extent.as_int32() && factors.size() &&
+          loop.As<ir::For>()->extent.as_int32() > 1) {
         break;
       }
-      CHECK_LE(extend, loops.back().As<ir::For>()->extent.as_int32());
+      extend *= loop.As<ir::For>()->extent.as_int32();
       factors.push_back(loop.As<ir::For>()->extent.as_int32());
     }
 
@@ -751,9 +887,7 @@ void LoopAssignReduce(ir::IRSchedule& ir_sch,
 
   // node output is same shape with reduce input.
   if (WithoutLastDimInReduce(shape, axes)) {
-    auto nloops = ir_sch.GetLoops(node_data->id());
-    ir_sch.Split(nloops.back(), shape);
-    // if using block shuffle
+    // if using two strep reduce.
     if (tensor_map.count(reducer_data->id() + "_1")) {
       LoopAssignReduceWithoutLast(ir_sch, node_data->id(), shape, axes, target);
       auto nloops = ir_sch.GetLoops(node_data->id());
@@ -766,8 +900,10 @@ void LoopAssignReduce(ir::IRSchedule& ir_sch,
       // copy loop info form rloops.
       copy_loop_info(nloops, rloops);
     } else {
-      LoopOrderAssignReduce(ir_sch, node_data->id(), axes, target);
       auto nloops = ir_sch.GetLoops(node_data->id());
+      ir_sch.Split(nloops.back(), shape);
+      LoopOrderAssignReduce(ir_sch, node_data->id(), axes, target);
+      nloops      = ir_sch.GetLoops(node_data->id());
       auto rloops = ir_sch.GetLoops(tensor_map.find(reducer_data->id())->second->name);
       if (nloops.size() < rloops.size()) {
         ir_sch.Split(nloops[0], {1, -1});
@@ -898,7 +1034,7 @@ void InsertSyncThread(ir::IRSchedule& ir_sch,
     if (idx > 0) {
       // insert syncthreads.
       auto loops = ir_sch.GetLoops(node_data->id());
-      ir_sch.SyncThreads(loops.back(), false);
+      ir_sch.SyncThreads(loops[loops.size() - 2], false);
       return;
     }
   }
@@ -951,16 +1087,21 @@ void MergeReduceToReduce(ir::IRSchedule& ir_sch,
   }
   if (WithoutLastDimInReduce(shape, axes)) {
     auto mshape = shape_dict.at(master->inlinks_in_order()[0]->source()->id());
-    // using block shuffle
     if (tensor_map.count(node_data->id() + "_1")) {
       if (shape == mshape) {
-        // block shuffle
+        // second step reduce
         {
           auto block = ir_sch.GetBlock(node_data->id());
           auto loops = ir_sch.GetLoops(master_data->id());
           ir_sch.SimpleComputeAt(block, loops.back());
+          // reduce init
+          {
+            auto block = ir_sch.GetBlock(node_data->id() + "__reduce_init");
+            auto loops = ir_sch.GetLoops(master_data->id() + "__reduce_init");
+            ir_sch.SimpleComputeAt(block, loops.back());
+          }
         }
-        // reduce loop
+        // first step reduce
         {
           auto n_tensor = tensor_map.find(node_data->id() + "_0")->second;
           auto m_tensor = tensor_map.find(master_data->id() + "_0")->second;
@@ -978,62 +1119,32 @@ void MergeReduceToReduce(ir::IRSchedule& ir_sch,
       } else {
         auto n_tensor = tensor_map.find(node_data->id() + "_0")->second;
         auto m_tensor = tensor_map.find(master_data->id() + "_0")->second;
-        if (n_tensor->shape.back() == m_tensor->shape.back()) {
-          // block shuffle
+        if (n_tensor->shape == m_tensor->shape) {
+          // second step reduce
           {
             auto block = ir_sch.GetBlock(node_data->id());
             auto loops = ir_sch.GetLoops(master_data->id());
             ir_sch.SimpleComputeAt(block, loops.back());
-          }
-          // reduce loop
-          {
-            auto n_tensor = tensor_map.find(node_data->id() + "_0")->second;
-            auto m_tensor = tensor_map.find(master_data->id() + "_0")->second;
-
-            auto n_block = ir_sch.GetBlock(n_tensor->name);
-            auto m_block = ir_sch.GetBlock(m_tensor->name);
-
-            auto n_loops = ir_sch.GetLoops(n_tensor->name);
-            auto m_loops = ir_sch.GetLoops(m_tensor->name);
-
-            std::vector<ir::Var> src_vars;
-            std::vector<ir::Expr> dst_vars;
-            for (int idx = 0; idx < m_loops.size() - 1; ++idx) {
-              src_vars.push_back(n_loops[idx].As<ir::For>()->loop_var);
-              dst_vars.push_back(ir::Expr(m_loops[idx].As<ir::For>()->loop_var));
-            }
-            ReplaceExpr(&n_block, src_vars, dst_vars);
-
-            int index = n_loops.size();
-            InsertExpr insert_expr(n_loops[index - 1], m_loops[index - 1]);
-            insert_expr(&m_loops[0]);
-
             // reduce init
             {
-              auto block = ir_sch.GetBlock(n_tensor->name + "__reduce_init");
-              auto loops = ir_sch.GetLoops(m_tensor->name + "__reduce_init");
+              auto block = ir_sch.GetBlock(node_data->id() + "__reduce_init");
+              auto loops = ir_sch.GetLoops(master_data->id() + "__reduce_init");
               ir_sch.SimpleComputeAt(block, loops.back());
             }
-            RemoveExpr remove_expr(n_loops[0]);
-            remove_expr(&ir_sch.GetModule().GetExprs().at(0));
           }
-        } else {
-          // block shuffle
-          {
-            auto block = ir_sch.GetBlock(node_data->id());
-            auto loops = ir_sch.GetLoops(master_data->id());
-            ir_sch.SimpleComputeAt(block, loops.back());
-          }
-          // reducer loop
+          // first step reduce
           {
             auto n_tensor = tensor_map.find(node_data->id() + "_0")->second;
             auto m_tensor = tensor_map.find(master_data->id() + "_0")->second;
 
-            auto n_loops = ir_sch.GetLoops(n_tensor->name);
-            auto m_loops = ir_sch.GetLoops(m_tensor->name);
+            auto n_loops = ir_sch.GetLoops(n_tensor->name + "__reduce_init");
+            auto m_loops = ir_sch.GetLoops(m_tensor->name + "__reduce_init");
 
-            MergeLoops(ir_sch.GetModule().GetExprs().at(0), n_loops, m_loops, 0);
+            CHECK_EQ(n_loops.size(), m_loops.size());
+            MergeLoops(ir_sch.GetModule().GetExprs().at(0), n_loops, m_loops, n_loops.size() - 1);
           }
+        } else {
+          LOG(FATAL) << "not support this type fusion!";
         }
       }
     } else {
@@ -1104,6 +1215,7 @@ void MergeReduceToReduce(ir::IRSchedule& ir_sch,
 
         auto n_loops = ir_sch.GetLoops(n_tensor->name);
         auto m_loops = ir_sch.GetLoops(m_tensor->name);
+        CHECK_EQ(n_loops.size(), m_loops.size());
 
         std::vector<ir::Var> src_vars;
         std::vector<ir::Expr> dst_vars;
@@ -1201,11 +1313,42 @@ void MergeReduceLoop(ir::IRSchedule& ir_sch,
       auto block = ir_sch.GetBlock(node_data->id());
       auto loops = ir_sch.GetLoops(master_data->id());
       ir_sch.SimpleComputeAt(block, loops.back());
+
+      if (ir_sch.HasBlock(node_data->id() + "__reduce_init")) {
+        auto block = ir_sch.GetBlock(node_data->id() + "__reduce_init");
+        auto loops = ir_sch.GetLoops(master_data->id());
+        ir_sch.SimpleComputeAt(block, loops.back());
+      }
     }
 
     break;
   } while (--index >= 0);
 }
+
+// The struct used to find all ir::For or ScheduleBlock in given block.
+class FindExprInBlock : public ir::IRMutator<> {
+ public:
+  FindExprInBlock() {}
+
+  std::vector<ir::Expr> operator()(Expr* expr) {
+    IRMutator::Visit(expr, expr);
+    return exprs_;
+  }
+
+ private:
+  void Visit(const ir::ScheduleBlockRealize* expr, Expr* op) override { exprs_.push_back(*op); }
+
+  void Visit(const ir::For* expr, Expr* op) override { exprs_.push_back(*op); }
+
+  void Visit(const ir::Block* expr, Expr* op) override {
+    auto node = op->As<ir::Block>();
+    for (auto stmt : node->stmts) {
+      IRMutator::Visit(&stmt, &stmt);
+    }
+  }
+
+  std::vector<ir::Expr> exprs_;
+};
 
 void LoopComputeAt(ir::IRSchedule& ir_sch,
                    Node* node,
@@ -1216,7 +1359,7 @@ void LoopComputeAt(ir::IRSchedule& ir_sch,
   auto& op_pattern_dict = Operator::GetAttrs<OpPatternKind>("OpPattern");
   if (!group->output_nodes.count(node)) {
     auto block = ir_sch.GetBlock(GetNodeData(node)->id());
-    ir_sch.SetBuffer(block, "local", true);
+    ir_sch.SetBuffer(block, "local");
   }
 
   if (op_pattern_dict[node->op()] == framework::kReduction) {
@@ -1258,8 +1401,37 @@ void LoopComputeAt(ir::IRSchedule& ir_sch,
     if (node_loops[index].As<ir::For>()->extent.as_int32() != master_loops[index].As<ir::For>()->extent.as_int32()) {
       continue;
     }
+    auto loop_body = master_loops[index].As<ir::For>()->body;
+    CHECK(loop_body.As<ir::Block>());
+    auto blocks = FindExprInBlock()(&loop_body);
 
-    MergeLoops(ir_sch.GetModule().GetExprs().at(0), node_loops, master_loops, index);
+    for (auto block : blocks) {
+      if (block.As<ir::ScheduleBlockRealize>()) {
+        auto n_block = ir_sch.GetBlock(node_data->id());
+
+        std::vector<ir::Var> src_vars;
+        std::vector<ir::Expr> dst_vars;
+
+        for (int idx = 0; idx <= index; ++idx) {
+          src_vars.push_back(node_loops[idx].As<ir::For>()->loop_var);
+          dst_vars.push_back(ir::Expr(master_loops[idx].As<ir::For>()->loop_var));
+        }
+        // replace unsed var with 0.
+        for (int idx = index + 1; idx < node_loops.size(); ++idx) {
+          src_vars.push_back(node_loops[idx].As<ir::For>()->loop_var);
+          dst_vars.push_back(ir::Expr(0));
+        }
+        ReplaceExpr(&n_block, src_vars, dst_vars);
+
+        InsertExpr insert_expr(n_block, block);
+        insert_expr(&master_loops[index]);
+
+        RemoveExpr remove_expr(node_loops[0]);
+        remove_expr(&ir_sch.GetModule().GetExprs().at(0));
+
+        break;
+      }
+    }
     break;
   } while (--index >= 0);
 }
@@ -1301,6 +1473,7 @@ Node* GetMaster(Node* node, const std::unordered_set<Node*>& nodes_inline, const
 }
 
 void SyncThreadWithShared(ir::IRSchedule& ir_sch,
+                          const GroupPtr& group,
                           const std::unordered_set<Node*>& nodes_inline,
                           const std::unordered_set<Node*>& nodes_set,
                           const absl::flat_hash_map<std::string, shape_t>& shape_dict,
@@ -1359,9 +1532,9 @@ void SyncThreadWithShared(ir::IRSchedule& ir_sch,
       continue;
     }
 
-    {
+    if (!group->output_nodes.count(node)) {
       auto block = ir_sch.GetBlock(node_data->id());
-      ir_sch.SetBuffer(block, "shared", true);
+      ir_sch.SetBuffer(block, "shared");
     }
 
     if (check_sync_mark(idx, master_data->id())) {

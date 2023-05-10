@@ -1208,7 +1208,7 @@ void OpLowerer::IRSchedule(ir::IRSchedule& ir_sch,
   // topological order.
   auto nodes_set      = group->NodeSet();
   auto v_consumers    = BuildVirtualConsumer(group, this->shape_dict_);
-  auto nodes_in_order = TopologicalOrder(group, v_consumers);
+  auto nodes_in_order = BFSTopologicalOrderWithPriority(group, v_consumers, this->shape_dict_);
   // find reducer.
   std::unordered_set<Node*> nodes_inline;
   auto greducer         = FindGlobalReducer(nodes_in_order);
@@ -1327,7 +1327,7 @@ void OpLowerer::IRSchedule(ir::IRSchedule& ir_sch,
   }
 
   VLOG(3) << "Before Sync IRLowerOp schedule, ir is: \n" << ir_sch.GetModule().GetExprs().at(0);
-  SyncThreadWithShared(ir_sch, nodes_inline, nodes_set, this->shape_dict_, tensor_map);
+  SyncThreadWithShared(ir_sch, group, nodes_inline, nodes_set, this->shape_dict_, tensor_map);
   VLOG(4) << "After IRSchedule,  ir is: \n" << ir_sch.GetModule().GetExprs().at(0);
 }
 
